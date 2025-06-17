@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Точная геолокация - TimeTracker</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          sans-serif;
+        margin: 0;
+        padding: 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        min-height: 100vh;
+      }
+      .container {
+        max-width: 400px;
+        margin: 0 auto;
+        background: rgba(255, 255, 255, 0.1);
+        padding: 30px;
+        border-radius: 20px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      }
+      h1 {
+        text-align: center;
+        margin-bottom: 30px;
+        font-size: 24px;
+      }
+      .status {
+        text-align: center;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 20px 0;
+        font-weight: bold;
+      }
+      .loading {
+        background: rgba(255, 193, 7, 0.3);
+      }
+      .success {
+        background: rgba(40, 167, 69, 0.3);
+      }
+      .error {
+        background: rgba(220, 53, 69, 0.3);
+      }
+
+      button {
+        width: 100%;
+        padding: 15px;
+        border: none;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.2);
+        color: white;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        margin: 10px 0;
+        transition: all 0.3s;
+      }
+      button:hover {
+        background: rgba(255, 255, 255, 0.3);
+        transform: translateY(-2px);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .info {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 15px;
+        border-radius: 10px;
+        margin: 20px 0;
+        font-size: 14px;
+      }
+      .location-details {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 15px;
+        border-radius: 10px;
+        margin: 20px 0;
+        font-size: 12px;
+        word-break: break-all;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🎯 Точная геолокация</h1>
+
+      <div id="status" class="status loading">Готов к получению геолокации</div>
+
+      <button id="checkInBtn" onclick="checkIn()">
+        📍 Отметиться на работе
+      </button>
+
+      <button id="checkOutBtn" onclick="checkOut()">
+        🚪 Отметиться с работы
+      </button>
+
+      <div class="info">
+        <strong>Что отслеживается:</strong><br />
+        • GPS координаты (высокая точность)<br />
+        • WiFi сети поблизости<br />
+        • Время и дата<br />
+        • Точность определения<br />
+        • Модель устройства
+      </div>
+
+      <div
+        id="locationDetails"
+        class="location-details"
+        style="display: none"
+      ></div>
+    </div>
+
+    <script>
+      let userId = null;
+      let userName = null;
+
+      // Получаем данные пользователя из URL параметров или Telegram WebApp
+      function initUser() {
+        const urlParams = new URLSearchParams(window.location.search);
+        userId = urlParams.get("user_id");
+        userName = urlParams.get("user_name");
+
+        // Если доступен Telegram WebApp API
+        if (window.Telegram && window.Telegram.WebApp) {
+          const tg = window.Telegram.WebApp;
+          tg.ready();
+
+          if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+            userId = tg.initDataUnsafe.user.id;
+            userName = tg.initDataUnsafe.user.first_name;
+          }
+        }
+      }
+
+      // Получение высокоточной геолокации
+      async function getHighAccuracyLocation() {
+        return new Promise((resolve, reject) => {
+          if (!navigator.geolocation) {
+            reject(new Error("Геолокация не поддерживается"));
+            return;
+          }
+
+          const options = {
+            enableHighAccuracy: true,
+            timeout: 30000,
+            maximumAge: 0,
+          };
+
+          navigator.geolocation.getCurrentPosition(
+            (position) => resolve(position),
+            (error) => reject(error),
+            options
+          );
+        });
+      }
+
+      // Получение информации о WiFi (ограниченно в браузере)
+      async function getNetworkInfo() {
+        const info = {
+          userAgent: navigator.userAgent,
+          platform: navigator.platform,
+          language: navigator.language,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        };
+
+        // Проверка подключения
+        if ("connection" in navigator) {
+          info.connection = {
+            effectiveType: navigator.connection.effectiveType,
+            downlink: navigator.connection.downlink,
+            rtt: navigator.connection.rtt,
+          };
+        }
+
+        return info;
+      }
+
+      // Отправка данных на сервер
+      async function sendLocationData(type, locationData) {
+        try {
+          const response = await fetch("/api/location", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              user_id: userId,
+              user_name: userName,
+              type: type, // 'check_in' или 'check_out'
+              ...locationData,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          return await response.json();
+        } catch (error) {
+          console.error("Ошибка отправки данных:", error);
+          throw error;
+        }
+      }
+
+      // Отметка прихода на работу
+      async function checkIn() {
+        await performLocationAction("check_in", "Отмечаемся на работе...");
+      }
+
+      // Отметка ухода с работы
+      async function checkOut() {
+        await performLocationAction("check_out", "Отмечаемся с работы...");
+      }
+
+      // Основная функция для работы с геолокацией
+      async function performLocationAction(actionType, loadingText) {
+        const statusDiv = document.getElementById("status");
+        const detailsDiv = document.getElementById("locationDetails");
+        const checkInBtn = document.getElementById("checkInBtn");
+        const checkOutBtn = document.getElementById("checkOutBtn");
+
+        try {
+          // Отключаем кнопки
+          checkInBtn.disabled = true;
+          checkOutBtn.disabled = true;
+
+          // Показываем статус загрузки
+          statusDiv.className = "status loading";
+          statusDiv.textContent = loadingText;
+
+          // Получаем геолокацию
+          const position = await getHighAccuracyLocation();
+          const networkInfo = await getNetworkInfo();
+
+          const locationData = {
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            accuracy: position.coords.accuracy,
+            altitude: position.coords.altitude,
+            altitudeAccuracy: position.coords.altitudeAccuracy,
+            heading: position.coords.heading,
+            speed: position.coords.speed,
+            timestamp: new Date().toISOString(),
+            networkInfo: networkInfo,
+          };
+
+          // Показываем детали
+          detailsDiv.innerHTML = `
+                    <strong>Данные геолокации:</strong><br>
+                    Координаты: ${position.coords.latitude.toFixed(
+                      6
+                    )}, ${position.coords.longitude.toFixed(6)}<br>
+                    Точность: ±${Math.round(position.coords.accuracy)}м<br>
+                    Время: ${new Date().toLocaleString()}<br>
+                    Устройство: ${networkInfo.platform}<br>
+                    Часовой пояс: ${networkInfo.timezone}
+                `;
+          detailsDiv.style.display = "block";
+
+          // Отправляем данные на сервер
+          const result = await sendLocationData(actionType, locationData);
+
+          // Показываем успех
+          statusDiv.className = "status success";
+          statusDiv.textContent =
+            actionType === "check_in"
+              ? "✅ Успешно отмечен приход на работу!"
+              : "✅ Успешно отмечен уход с работы!";
+
+          // Если есть Telegram WebApp, отправляем данные обратно
+          if (window.Telegram && window.Telegram.WebApp) {
+            window.Telegram.WebApp.sendData(
+              JSON.stringify({
+                action: actionType,
+                success: true,
+                location: locationData,
+              })
+            );
+          }
+        } catch (error) {
+          console.error("Ошибка:", error);
+          statusDiv.className = "status error";
+          statusDiv.textContent = `❌ Ошибка: ${error.message}`;
+
+          detailsDiv.innerHTML = `<strong>Ошибка:</strong> ${error.message}`;
+          detailsDiv.style.display = "block";
+        } finally {
+          // Включаем кнопки обратно
+          checkInBtn.disabled = false;
+          checkOutBtn.disabled = false;
+        }
+      }
+
+      // Инициализация при загрузке страницы
+      document.addEventListener("DOMContentLoaded", function () {
+        initUser();
+
+        // Проверяем поддержку геолокации
+        if (!navigator.geolocation) {
+          document.getElementById("status").className = "status error";
+          document.getElementById("status").textContent =
+            "❌ Геолокация не поддерживается";
+          document.getElementById("checkInBtn").disabled = true;
+          document.getElementById("checkOutBtn").disabled = true;
+        }
+      });
+    </script>
+  </body>
+</html>
