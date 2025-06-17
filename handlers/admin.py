@@ -2,63 +2,219 @@ from aiogram import Router, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import logging
 
 from database import db
-from config import ADMIN_IDS
+from config import ADMIN_IDS, OFFICE_LATITUDE, OFFICE_LONGITUDE
+from utils.excel_export import format_duration
 
 router = Router()
+logger = logging.getLogger(__name__)
 
-class ManualEntry(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_action = State()
-    waiting_for_checkin_time = State()
-    waiting_for_checkout_time = State()
+class ManualCheck(StatesGroup):
+    select_user_checkin = State()
+    enter_time_checkin = State()
+    select_user_checkout = State()
+    enter_time_checkout = State()
+    waiting_for_category = State()
+    waiting_for_confirmation = State()
 
 class UserManagement(StatesGroup):
     waiting_for_category = State()
     waiting_for_confirmation = State()
-    waiting_for_search = State()
+
+async def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
+    """Returns the main admin panel keyboard."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Управление сотрудниками", callback_data="admin_users")],
+        [InlineKeyboardButton(text="📊 Статистика и отчёты", callback_data="admin_stats")],
+        [
+            InlineKeyboardButton(text="➕ Приход вручную", callback_data="manual_checkin_start"),
+            InlineKeyboardButton(text="➖ Уход вручную", callback_data="manual_checkout_start")
+        ]
+    ])
 
 @router.message(F.text == "👨‍💼 Админ панель")
-async def admin_panel(message: types.Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Управление сотрудниками", callback_data="admin_users")],
-        [InlineKeyboardButton(text="📊 Статистика и отчёты", callback_data="admin_stats")]
-    ])
+async def admin_panel(message: types.Message, state: FSMContext):
+    await state.clear()
+    keyboard = await get_admin_panel_keyboard()
     await message.answer(
         "👨‍💼 <b>Панель администратора</b>\n\nВыберите раздел:",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
 
+@router.callback_query(F.data == "admin_back")
+async def admin_back_button(callback: types.CallbackQuery, state: FSMContext):
+    """Go back to main admin menu by deleting old message and sending a new one."""
+    await state.clear()
+    
+    try:
+        # Delete the message with the inline keyboard
+        await callback.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete message on admin_back: {e}")
+
+    # Send a new message with the main admin panel
+    keyboard = await get_admin_panel_keyboard()
+    await callback.message.answer(
+        "👨‍💼 <b>Панель администратора</b>\n\nВыберите раздел:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
 @router.callback_query(F.data == "admin_users")
-async def show_all_users(callback: types.CallbackQuery):
-    all_users = await db.get_all_users()
-    if not all_users:
+async def show_employee_management_menu(callback: types.CallbackQuery, state: FSMContext):
+    """Shows the main employee management menu."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Все сотрудники", callback_data="admin_all_users_status")],
+        [InlineKeyboardButton(text="⏳ Обработать заявки", callback_data="admin_pending")],
+        [InlineKeyboardButton(text="🗃 Архивировать сотрудника", callback_data="admin_archive_user")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
+    ])
+    
+    await callback.message.edit_text(
+        "👥 <b>Управление сотрудниками</b>\n\nВыберите действие:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_all_users_status")
+async def show_all_users_by_status(callback: types.CallbackQuery):
+    """Displays a list of all approved users, grouped by department."""
+    users = await db.get_users_by_status('approved')
+    
+    if not users:
         await callback.message.edit_text(
-            "👥 <b>Управление сотрудниками</b>\n\nНет зарегистрированных пользователей.",
+            "👥 <b>Все сотрудники</b>\n\nНет утвержденных сотрудников.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")]
+            ]),
             parse_mode="HTML"
         )
         await callback.answer()
         return
-    approved_users = [u for u in all_users if u['status'] == 'approved']
-    pending_users = [u for u in all_users if u['status'] == 'pending']
-    archived_users = [u for u in all_users if u['status'] == 'archived']
-    message_text = "👥 <b>Управление сотрудниками</b>\n\n"
-    if approved_users:
-        message_text += f"✅ <b>Активные ({len(approved_users)}):</b>\n" + "\n".join(f"• {u['display_name'] or u['full_name'] or 'Unknown'}" for u in approved_users[:10]) + "\n\n"
-    if pending_users:
-        message_text += f"⏳ <b>Заявки на регистрацию ({len(pending_users)}):</b>\n" + "\n".join(f"• {u['display_name'] or u['full_name'] or 'Unknown'}" for u in pending_users[:5]) + "\n\n"
-    if archived_users:
-        message_text += f"🗃 <b>Архив ({len(archived_users)}):</b>\n" + "\n".join(f"• {u['display_name'] or u['full_name'] or 'Unknown'}" for u in archived_users[:5]) + "\n\n"
+
+    # Группируем пользователей по категориям
+    categories = {"кухня": [], "зал": [], "мойка": [], "бар": []}
+    for user in users:
+        category = user.get('category', 'зал')
+        if category in categories:
+            categories[category].append(user)
+    
+    message_text = "👥 <b>Все сотрудники</b>\n\n"
+    emoji_map = {"кухня": "🍳", "зал": "🍽", "мойка": "🧽", "бар": "🍻"}
+    
+    keyboard_buttons = []
+    
+    for category, users_list in categories.items():
+        if users_list:  # Показываем категорию только если есть сотрудники
+            message_text += f"{emoji_map[category]} <b>{category.upper()}</b> ({len(users_list)})\n"
+            
+            for user in users_list:
+                name = user['display_name'] or user['full_name'] or 'Unknown'
+                user_id = user['user_id']
+                
+                # Проверяем статус сотрудника (на смене или нет)
+                session = await db.get_today_session(user_id)
+                status_emoji = "🟢" if session and session['check_in'] and not session['check_out'] else "🔴"
+                
+                message_text += f"{status_emoji} {name}\n"
+                
+                # Добавляем кнопку для каждого сотрудника
+                keyboard_buttons.append([
+                    InlineKeyboardButton(
+                        text=f"{status_emoji} {name}", 
+                        callback_data=f"user_stats_{user_id}"
+                    )
+                ])
+            
+            message_text += "\n"
+    
+    # Добавляем кнопку "Назад"
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await callback.message.edit_text(
+        text=message_text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("user_stats_"))
+async def show_user_detailed_stats(callback: types.CallbackQuery):
+    """Показывает детальную статистику выбранного сотрудника."""
+    user_id = int(callback.data.split("_")[2])
+    
+    # Получаем информацию о пользователе
+    user_info = await db.get_user_info(user_id)
+    if not user_info:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    
+    name = user_info['display_name'] or user_info['full_name']
+    category = user_info.get('category', 'зал')
+    emoji_map = {"кухня": "🍳", "зал": "🍽", "мойка": "🧽", "бар": "🍻"}
+    category_emoji = emoji_map.get(category, "📋")
+    
+    # Получаем статистику за разные периоды
+    today_stats = await db.get_user_stats(user_id, 1)
+    week_stats = await db.get_user_stats(user_id, 7)
+    month_stats = await db.get_user_stats(user_id, 30)
+    
+    # Рассчитываем общее время для каждого периода
+    today_minutes = sum(session['duration_minutes'] for session in today_stats)
+    week_minutes = sum(session['duration_minutes'] for session in week_stats)
+    month_minutes = sum(session['duration_minutes'] for session in month_stats)
+    
+    # Проверяем, на смене ли сейчас сотрудник
+    today_session = await db.get_today_session(user_id)
+    is_active = today_session and today_session['check_in'] and not today_session['check_out']
+    
+    if is_active:
+        status = "🟢 На смене"
+        check_in_time = datetime.fromisoformat(today_session['check_in']).strftime('%H:%M')
+        current_time = datetime.now()
+        check_in_dt = datetime.fromisoformat(today_session['check_in'])
+        current_duration = int((current_time - check_in_dt).total_seconds() / 60)
+        today_minutes = current_duration  # Обновляем время сегодняшнего дня
+    else:
+        status = "🔴 Не на смене"
+        check_in_time = None
+        current_duration = 0
+    
+    # Формируем сообщение
+    message_text = f"👤 <b>Статистика сотрудника</b>\n\n"
+    message_text += f"<b>Имя:</b> {name}\n"
+    message_text += f"<b>Подразделение:</b> {category_emoji} {category.upper()}\n"
+    message_text += f"<b>Статус:</b> {status}\n\n"
+    
+    message_text += "<b>Отработано времени:</b>\n"
+    message_text += f"• Сегодня: {format_duration(today_minutes)}\n"
+    message_text += f"• За неделю: {format_duration(week_minutes)}\n"
+    message_text += f"• За месяц: {format_duration(month_minutes)}\n\n"
+    
+    if is_active:
+        message_text += f"<b>Текущая смена:</b>\n"
+        message_text += f"• Начало: {check_in_time}\n"
+        message_text += f"• Длительность: {format_duration(current_duration)}\n"
+    
+    # Создаем клавиатуру с кнопками
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏳ Обработать заявки", callback_data="admin_pending")],
-        [InlineKeyboardButton(text="🗃 Архивировать сотрудника", callback_data="admin_archive_user")],
-        [InlineKeyboardButton(text="🔍 Поиск сотрудника", callback_data="admin_search_user")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
+        [InlineKeyboardButton(text="🔙 К списку сотрудников", callback_data="admin_all_users_status")]
     ])
-    msg = await callback.message.answer(message_text, reply_markup=keyboard, parse_mode="HTML")
+    
+    await callback.message.edit_text(
+        text=message_text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
 @router.callback_query(F.data == "admin_stats")
 async def show_stats_menu(callback: types.CallbackQuery):
@@ -67,132 +223,55 @@ async def show_stats_menu(callback: types.CallbackQuery):
          InlineKeyboardButton(text="🍽 Зал", callback_data="stats_category_зал")],
         [InlineKeyboardButton(text="🧽 Мойка", callback_data="stats_category_мойка"),
          InlineKeyboardButton(text="🍻 Бар", callback_data="stats_category_бар")],
-        [InlineKeyboardButton(text="📅 Периоды", callback_data="admin_period_reports")],
-        [InlineKeyboardButton(text="📥 Скачать Excel", callback_data="admin_report_menu")],
+        [InlineKeyboardButton(text="📅 Отчет за период", callback_data="admin_period_reports")],
+        [InlineKeyboardButton(text="📥 Скачать полный Excel", callback_data="admin_report_menu")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
     ])
-    msg = await callback.message.answer("📊 <b>Статистика и отчёты</b>\n\nВыберите действие:", reply_markup=keyboard, parse_mode="HTML")
-
-@router.callback_query(F.data == "admin_back")
-async def admin_back_callback(callback: types.CallbackQuery):
-    current_text = callback.message.text or ""
-    if "Управление сотрудниками" in current_text or "Архивирование сотрудника" in current_text or "Поиск пользователя" in current_text:
-        # Главное админ-меню (без кнопки 'Назад')
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Управление сотрудниками", callback_data="admin_users")],
-            [InlineKeyboardButton(text="📊 Статистика и отчёты", callback_data="admin_stats")]
-        ])
-        await callback.message.edit_text(
-            "👨‍💼 <b>Панель администратора</b>\n\nВыберите раздел:",
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    elif "Статистика и отчёты" in current_text or "Отчеты по периодам" in current_text:
-        # Главное меню статистики
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🍳 Кухня", callback_data="stats_category_кухня"),
-             InlineKeyboardButton(text="🍽 Зал", callback_data="stats_category_зал")],
-            [InlineKeyboardButton(text="🧽 Мойка", callback_data="stats_category_мойка"),
-             InlineKeyboardButton(text="🍻 Бар", callback_data="stats_category_бар")],
-            [InlineKeyboardButton(text="📅 Периоды", callback_data="admin_period_reports")],
-            [InlineKeyboardButton(text="📥 Скачать Excel", callback_data="admin_report_menu")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
-        ])
-        await callback.message.edit_text(
-            "📊 <b>Статистика и отчёты</b>\n\nВыберите действие:",
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    elif "Детальный отчет" in current_text or "ИТОГО ПО КОМПАНИИ" in current_text:
-        # Возврат к выбору периода
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📅 За неделю", callback_data="report_period_week"),
-                InlineKeyboardButton(text="📅 За 2 недели", callback_data="report_period_2weeks")
-            ],
-            [
-                InlineKeyboardButton(text="📅 За месяц", callback_data="report_period_month"),
-                InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="report_period_prev_month")
-            ],
-            [
-                InlineKeyboardButton(text="🔙 Назад", callback_data="admin_stats")
-            ]
-        ])
-        await callback.message.edit_text(
-            "📅 **Отчеты по периодам**\n\n"
-            "Выберите период для детального отчета по всем категориям сотрудников:\n\n"
-            "• **За неделю** - последние 7 дней\n"
-            "• **За 2 недели** - последние 14 дней\n"
-            "• **За месяц** - последние 30 дней\n"
-            "• **Прошлый месяц** - предыдущий календарный месяц",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-    else:
-        # По умолчанию — главное меню
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Управление сотрудниками", callback_data="admin_users")],
-            [InlineKeyboardButton(text="📊 Статистика и отчёты", callback_data="admin_stats")]
-        ])
-        await callback.message.edit_text(
-            "👨‍💼 <b>Панель администратора</b>\n\nВыберите раздел:",
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+    await callback.message.edit_text("📊 <b>Статистика и отчёты</b>\n\nВыберите действие:", reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
 
-@router.callback_query(F.data == "admin_pending")
-async def show_pending_users(callback: types.CallbackQuery):
-    """Show pending registrations"""
+async def _update_pending_list(message: types.Message):
+    """Helper function to generate and display the list of pending users."""
     pending_users = await db.get_pending_users()
     
     if not pending_users:
-        await callback.message.edit_text(
-            "📋 **Заявки на регистрацию**\n\n"
-            "Новых заявок нет."
+        await message.edit_text(
+            "📋 <b>Заявки на регистрацию</b>\n\nНовых заявок нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")]
+            ]),
+            parse_mode="HTML"
         )
-        await callback.answer()
         return
-    
-    message_text = "⏳ **Заявки на регистрацию**\n\n"
+
+    message_text = "⏳ <b>Заявки на регистрацию</b>\n\nВыберите заявку для обработки:\n\n"
     keyboard_buttons = []
     
     for user in pending_users:
-        user_info = f"👤 <b>{user['display_name']}</b>\n"
-        user_info += f"   • ID: {user['user_id']}\n"
-        user_info += f"   • Username: @{user['username'] if user['username'] else 'не указан'}\n"
-        
-        # Handle datetime object properly
-        if user['first_seen']:
-            if isinstance(user['first_seen'], str):
-                date_str = user['first_seen'][:10]
-            else:
-                date_str = user['first_seen'].strftime('%d.%m.%Y')
-        else:
-            date_str = 'Неизвестно'
-        
-        user_info += f"   • Дата заявки: {date_str}\n\n"
-        message_text += user_info
-        
-        # Add approve/reject buttons for each user
+        user_info = (
+            f"👤 <b>{user['display_name']}</b> (<i>@{user.get('username', 'N/A')}</i>)\n"
+            f"   - ID: <code>{user['user_id']}</code>\n"
+            f"   - Телефон: {user.get('phone', 'Не указан')}\n"
+            f"   - Специализация: {user.get('category', 'Не указана').title()}\n"
+        )
+        message_text += user_info + "\n"
         keyboard_buttons.append([
-            InlineKeyboardButton(
-                text=f"✅ Одобрить {user['display_name']}", 
-                callback_data=f"approve_{user['user_id']}"
-            ),
-            InlineKeyboardButton(
-                text=f"❌ Отклонить", 
-                callback_data=f"reject_{user['user_id']}"
-            )
+            InlineKeyboardButton(text=f"✅ Одобрить {user['display_name']}", callback_data=f"approve_{user['user_id']}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user['user_id']}")
         ])
     
-    keyboard_buttons.append([
-        InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")
-    ])
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")])
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    
-    await callback.message.edit_text(message_text, reply_markup=keyboard, parse_mode="HTML")
+    await message.edit_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "admin_pending")
+async def show_pending_users(callback: types.CallbackQuery):
+    """Show pending registrations by calling the helper."""
+    await _update_pending_list(callback.message)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("approve_"))
@@ -203,40 +282,33 @@ async def approve_user(callback: types.CallbackQuery):
     
     await db.approve_user(user_id, admin_id)
     
-    # Send welcome message to approved user
     try:
-        from bot import bot  # Import bot instance
+        from bot import bot
         await bot.send_message(
             user_id,
             "🎉 **Поздравляем!**\n\n"
-            "✅ **Вы добавлены в наш дружный коллектив!**\n\n"
-            "Теперь вы можете:\n"
-            "• 🟢 Отмечать приход на работу\n"
-            "• 🔴 Отмечать уход с работы\n"
-            "• 📊 Просматривать свою статистику\n"
-            "• 📥 Скачивать отчеты\n\n"
-            "Используйте команду /start для начала работы!",
+            "✅ **Вы приняты на работу!**\n\n"
+            "Теперь вы можете использовать команду /start, чтобы открыть главное меню и начать отмечать рабочее время.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        print(f"Failed to notify approved user {user_id}: {e}")
+        logger.error(f"Failed to notify approved user {user_id}: {e}")
     
-    await callback.answer("✅ Пользователь одобрен! Уведомление отправлено.", show_alert=True)
+    await callback.answer("✅ Пользователь одобрен!", show_alert=True)
     
-    # Refresh the pending list
-    await show_pending_users(callback)
+    await _update_pending_list(callback.message)
 
 @router.callback_query(F.data.startswith("reject_"))
 async def reject_user(callback: types.CallbackQuery):
     """Reject user registration"""
     user_id = int(callback.data.split("_")[1])
+    admin_id = callback.from_user.id
     
-    await db.block_user(user_id)
+    await db.reject_user(user_id, admin_id)
     
-    await callback.answer("❌ Заявка отклонена", show_alert=True)
+    await callback.answer("❌ Пользователь отклонен", show_alert=True)
     
-    # Refresh the pending list
-    await show_pending_users(callback)
+    await _update_pending_list(callback.message)
 
 @router.callback_query(F.data == "admin_archive_user")
 async def start_archive_user(callback: types.CallbackQuery):
@@ -345,214 +417,18 @@ async def archive_select_user(callback: types.CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data == "admin_search_user")
-async def show_search_user_panel(callback: types.CallbackQuery):
+async def show_search_user_panel(callback: types.CallbackQuery, state: FSMContext):
     """Show search user panel"""
+    await state.clear()  # Clear any previous states
     await callback.message.edit_text(
-        "🔍 **Поиск пользователя**\n\n"
-        "Введите Telegram ID пользователя или его имя:",
+        "🔍 **Поиск сотрудника**\n\n"
+        "Эта функция временно отключена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")]
+        ]),
         parse_mode="Markdown"
     )
     await callback.answer()
-
-@router.message(UserManagement.waiting_for_search)
-async def search_user(message: types.Message):
-    """Search for a user by ID or name"""
-    text = message.text.strip()
-    
-    # Try to parse as ID
-    try:
-        user_id = int(text)
-        user_info = await db.get_user_info(user_id)
-        if user_info:
-            await message.answer(
-                f"👤 **Информация о пользователе**\n\n"
-                f"• ID: {user_id}\n"
-                f"• Имя: {user_info['display_name'] or user_info['full_name'] or 'Unknown'}\n"
-                f"• Категория: {user_info.get('category', 'Неизвестно')}\n"
-                f"• Статус: {user_info['status']}\n"
-                f"• Последняя активность: {user_info['last_active'].strftime('%Y-%m-%d') if user_info['last_active'] else 'Никогда'}\n"
-            )
-        else:
-            await message.answer("❌ Пользователь не найден")
-    except ValueError:
-        # Try to find user by name
-        all_users = await db.get_all_users()
-        users = []
-        search_text = text.lower()
-        
-        # Search in display_name, full_name, and username
-        for user in all_users:
-            display_name = (user.get('display_name') or '').lower()
-            full_name = (user.get('full_name') or '').lower()
-            username = (user.get('username') or '').lower()
-            
-            if (search_text in display_name or 
-                search_text in full_name or 
-                search_text in username):
-                users.append(user)
-        
-        if users:
-            message_text = "👥 **Найденные пользователи:**\n\n"
-            for user in users:
-                message_text += f"• ID: {user['user_id']}\n"
-                message_text += f"• Имя: {user.get('display_name') or user.get('full_name') or 'Unknown'}\n"
-                message_text += f"• Категория: {user.get('category', 'Неизвестно')}\n"
-                message_text += f"• Статус: {user['status']}\n"
-                
-                # Handle datetime properly for last_active
-                if user['last_active']:
-                    if isinstance(user['last_active'], str):
-                        last_active = user['last_active'][:10]
-                    else:
-                        last_active = user['last_active'].strftime('%Y-%m-%d')
-                else:
-                    last_active = 'Никогда'
-                    
-                message_text += f"• Последняя активность: {last_active}\n\n"
-            await message.answer(message_text)
-        else:
-            await message.answer("❌ Пользователь не найден")
-
-@router.callback_query(F.data == "manual_checkin_time", ManualEntry.waiting_for_action)
-async def manual_checkin_with_time(callback: types.CallbackQuery):
-    """Start manual check-in with custom time"""
-    await callback.message.edit_text(
-        "🕐 **Отметка прихода с указанием времени**\n\n"
-        "Введите время прихода в формате ЧЧ:ММ\n"
-        "Например: `09:30` или `08:15`\n\n"
-        "📅 Дата будет установлена автоматически (сегодня)",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "manual_checkout_time", ManualEntry.waiting_for_action)
-async def manual_checkout_with_time(callback: types.CallbackQuery):
-    """Start manual check-out with custom time"""
-    await callback.message.edit_text(
-        "🕐 **Отметка ухода с указанием времени**\n\n"
-        "Введите время ухода в формате ЧЧ:ММ\n"
-        "Например: `18:30` или `17:45`\n\n"
-        "📅 Дата будет установлена автоматически (сегодня)",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@router.message(ManualEntry.waiting_for_checkin_time)
-async def process_checkin_time(message: types.Message):
-    """Process manual check-in with custom time"""
-    time_text = message.text.strip()
-    
-    # Validate time format
-    try:
-        time_parts = time_text.split(':')
-        if len(time_parts) != 2:
-            raise ValueError("Invalid format")
-        
-        hours = int(time_parts[0])
-        minutes = int(time_parts[1])
-        
-        if not (0 <= hours <= 23) or not (0 <= minutes <= 59):
-            raise ValueError("Invalid time")
-            
-    except ValueError:
-        await message.answer(
-            "❌ **Неверный формат времени**\n\n"
-            "Используйте формат ЧЧ:ММ\n"
-            "Например: `09:30`, `08:15`, `10:00`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    data = await callback.message.bot.get_data()
-    target_user_id = data['target_user_id']
-    target_user_name = data['target_user_name']
-    
-    # Create datetime with today's date and specified time
-    today = date.today()
-    checkin_datetime = datetime.combine(today, datetime.strptime(time_text, '%H:%M').time())
-    
-    # Add custom check-in to database
-    from config import OFFICE_LATITUDE, OFFICE_LONGITUDE
-    success = await db.check_in_with_time(
-        target_user_id,
-        f"manual_{target_user_id}",
-        target_user_name,
-        checkin_datetime,
-        OFFICE_LATITUDE, 
-        OFFICE_LONGITUDE
-    )
-    
-    if success:
-        await message.answer(
-            f"✅ **Приход отмечен успешно!**\n\n"
-            f"👤 Сотрудник: {target_user_name}\n"
-            f"📅 Дата: {today.strftime('%d.%m.%Y')}\n"
-            f"🕐 Время: {time_text}\n"
-            f"📝 Отметка: Ручная (администратор)",
-            parse_mode="Markdown"
-        )
-    else:
-        await message.answer(
-            f"⚠️ **Ошибка**\n\n"
-            f"Сотрудник уже отметил приход на {today.strftime('%d.%m.%Y')}"
-        )
-
-@router.message(ManualEntry.waiting_for_checkout_time)
-async def process_checkout_time(message: types.Message):
-    """Process manual check-out with custom time"""
-    time_text = message.text.strip()
-    
-    # Validate time format
-    try:
-        time_parts = time_text.split(':')
-        if len(time_parts) != 2:
-            raise ValueError("Invalid format")
-        
-        hours = int(time_parts[0])
-        minutes = int(time_parts[1])
-        
-        if not (0 <= hours <= 23) or not (0 <= minutes <= 59):
-            raise ValueError("Invalid time")
-            
-    except ValueError:
-        await message.answer(
-            "❌ **Неверный формат времени**\n\n"
-            "Используйте формат ЧЧ:ММ\n"
-            "Например: `18:30`, `17:45`, `19:00`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    data = await callback.message.bot.get_data()
-    target_user_id = data['target_user_id']
-    target_user_name = data['target_user_name']
-    
-    # Create datetime with today's date and specified time
-    today = date.today()
-    checkout_datetime = datetime.combine(today, datetime.strptime(time_text, '%H:%M').time())
-    
-    # Add custom check-out to database
-    duration_minutes = await db.check_out_with_time(target_user_id, checkout_datetime)
-    
-    if duration_minutes is not None:
-        from utils.excel_export import format_duration
-        duration_str = format_duration(duration_minutes)
-        
-        await message.answer(
-            f"✅ **Уход отмечен успешно!**\n\n"
-            f"👤 Сотрудник: {target_user_name}\n"
-            f"📅 Дата: {today.strftime('%d.%m.%Y')}\n"
-            f"🕐 Время ухода: {time_text}\n"
-            f"⏱ Отработано: {duration_str}\n"
-            f"📝 Отметка: Ручная (администратор)",
-            parse_mode="Markdown"
-        )
-    else:
-        await message.answer(
-            f"⚠️ **Ошибка**\n\n"
-            f"Не найдено активной рабочей сессии на {today.strftime('%d.%m.%Y')}.\n"
-            f"Сначала отметьте приход."
-        )
 
 @router.callback_query(F.data == "admin_manage_categories")
 async def manage_categories(callback: types.CallbackQuery):
@@ -690,14 +566,13 @@ async def show_period_report(callback: types.CallbackQuery):
         category_total_hours = category_total_minutes / 60
         
         message_text += f"\n{emoji_map[category]} **{category.upper()}** ({len(users)} чел.)\n"
-        message_text += f"├─ Общее время: {category_total_hours:.1f} ч.\n"
+        message_text += f"├─ Общее время: {format_duration(category_total_minutes)}\n"
         
         # Sort users by total time worked
         sorted_users = sorted(users.items(), key=lambda x: x[1]['total_minutes'], reverse=True)
         
         for user_id, user_data in sorted_users[:3]:  # Show top 3 workers
-            hours = user_data['total_minutes'] / 60
-            message_text += f"├─ **{user_data['name']}**: {hours:.1f} ч. ({user_data['days_worked']} дн.)\n"
+            message_text += f"├─ **{user_data['name']}**: {format_duration(user_data['total_minutes'])} ({user_data['days_worked']} дн.)\n"
         
         if len(sorted_users) > 3:
             message_text += f"└─ ... и еще {len(sorted_users) - 3} сотрудников\n"
@@ -706,17 +581,185 @@ async def show_period_report(callback: types.CallbackQuery):
         total_company_users += len(users)
     
     # Company totals
-    total_company_hours = total_company_minutes / 60
-    avg_hours_per_user = total_company_hours / total_company_users if total_company_users > 0 else 0
+    avg_minutes_per_user = total_company_minutes / total_company_users if total_company_users > 0 else 0
     
     message_text += f"\n📈 **ИТОГО ПО КОМПАНИИ:**\n"
     message_text += f"👥 Работало сотрудников: {total_company_users}\n"
-    message_text += f"⏱ Общее время: {total_company_hours:.1f} ч.\n"
-    message_text += f"📊 В среднем на сотрудника: {avg_hours_per_user:.1f} ч.\n"
+    message_text += f"⏱ Общее время: {format_duration(total_company_minutes)}\n"
+    message_text += f"📊 В среднем на сотрудника: {format_duration(avg_minutes_per_user)}\n"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_period_reports")]
     ])
     
     await callback.message.edit_text(message_text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer() 
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_all_users")
+async def show_all_users_list(callback: types.CallbackQuery):
+    """Show all users with their categories"""
+    users = await db.get_users_by_category(include_archived=False)
+    
+    if not users:
+        await callback.message.edit_text(
+            "👥 <b>Все сотрудники</b>\n\nНет активных сотрудников.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")]
+            ]),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+    
+    # Группируем пользователей по категориям
+    categories = {"кухня": [], "зал": [], "мойка": [], "бар": []}
+    for user in users:
+        if user['status'] == 'approved':  # Показываем только одобренных пользователей
+            category = user.get('category', 'зал')
+            if category in categories:
+                categories[category].append(user)
+    
+    message_text = "👥 <b>Все сотрудники</b>\n\n"
+    emoji_map = {"кухня": "🍳", "зал": "🍽", "мойка": "🧽", "бар": "🍻"}
+    
+    for category, users_list in categories.items():
+        if users_list:  # Показываем категорию только если есть сотрудники
+            message_text += f"{emoji_map[category]} <b>{category.upper()}</b> ({len(users_list)})\n"
+            for user in users_list:
+                name = user['display_name'] or user['full_name'] or 'Unknown'
+                message_text += f"• {name}\n"
+            message_text += "\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")]
+    ])
+    
+    await callback.message.edit_text(
+        message_text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# --- MANUAL CHECK-IN AND CHECK-OUT FLOW ---
+
+async def list_users_for_manual_action(callback: types.CallbackQuery, state: FSMContext, action: str):
+    """Generic function to list users for manual check-in/out."""
+    approved_users = await db.get_users_by_status('approved')
+    if not approved_users:
+        await callback.message.edit_text(
+            f"Нет утвержденных сотрудников для выполнения действия.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]])
+        )
+        await callback.answer()
+        return
+
+    keyboard_buttons = []
+    for user in approved_users:
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                text=f"{user['display_name'] or user['full_name']}",
+                callback_data=f"manual_select_user_{action}_{user['user_id']}"
+            )
+        ])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")])
+    
+    action_text = "прихода" if action == "checkin" else "ухода"
+    await callback.message.edit_text(
+        f"👤 Выберите сотрудника для ручной отметки {action_text}:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "manual_checkin_start")
+async def manual_checkin_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ManualCheck.select_user_checkin)
+    await list_users_for_manual_action(callback, state, "checkin")
+
+@router.callback_query(F.data == "manual_checkout_start")
+async def manual_checkout_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ManualCheck.select_user_checkout)
+    await list_users_for_manual_action(callback, state, "checkout")
+
+
+@router.callback_query(F.data.startswith("manual_select_user_"))
+async def manual_user_selected(callback: types.CallbackQuery, state: FSMContext):
+    logger.info(f"manual_user_selected callback: {callback.data}")
+    parts = callback.data.split("_")
+    action = parts[3]
+    user_id = int(parts[4])
+    logger.info(f"Selected user_id: {user_id}, action: {action}")
+    user_info = await db.get_user_info(user_id)
+    if not user_info:
+        logger.error(f"Failed to get user info for user_id: {user_id}")
+        await callback.answer("Ошибка: информация о пользователе не найдена", show_alert=True)
+        return
+    user_name = user_info['display_name'] or user_info['full_name']
+    logger.info(f"User name: {user_name}")
+
+    await state.update_data(target_user_id=user_id, target_user_name=user_name)
+
+    if action == "checkin":
+        await state.set_state(ManualCheck.enter_time_checkin)
+        action_text = "прихода"
+    else:
+        await state.set_state(ManualCheck.enter_time_checkout)
+        action_text = "ухода"
+        
+    await callback.message.edit_text(
+        f"Выбран сотрудник: <b>{user_name}</b>.\n\n"
+        f"🕐 Введите время {action_text} в формате <b>ЧЧ:ММ</b> (например, 09:30).",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]])
+    )
+    await callback.answer()
+
+
+@router.message(ManualCheck.enter_time_checkin, F.text)
+async def manual_checkin_time_entered(message: types.Message, state: FSMContext):
+    """Processes the manually entered check-in time."""
+    data = await state.get_data()
+    user_id = data.get("target_user_id")
+
+    try:
+        time_obj = datetime.strptime(message.text, "%H:%M").time()
+        checkin_datetime = datetime.combine(date.today(), time_obj)
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, 09:30).", parse_mode="HTML")
+        return
+
+    success, result_message = await db.check_in_with_time(user_id, checkin_datetime)
+
+    if success:
+        user_info = await db.get_user_info(user_id)
+        await message.answer(f"✅ Приход для сотрудника <b>{user_info['display_name']}</b> успешно зарегистрирован на {checkin_datetime.strftime('%H:%M')}.", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Не удалось отметить приход.\nПричина: {result_message}", parse_mode="HTML")
+    
+    await state.clear()
+
+
+@router.message(ManualCheck.enter_time_checkout, F.text)
+async def manual_checkout_time_entered(message: types.Message, state: FSMContext):
+    """Processes the manually entered check-out time."""
+    data = await state.get_data()
+    user_id = data.get("target_user_id")
+
+    try:
+        time_obj = datetime.strptime(message.text, "%H:%M").time()
+        checkout_datetime = datetime.combine(date.today(), time_obj)
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, 18:00).", parse_mode="HTML")
+        return
+
+    duration, result_message = await db.check_out_with_time(user_id, checkout_datetime)
+
+    if duration is not None:
+        user_info = await db.get_user_info(user_id)
+        await message.answer(f"✅ Уход для сотрудника <b>{user_info['display_name']}</b> успешно зарегистрирован на {checkout_datetime.strftime('%H:%M')}.\n\n{result_message}", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Не удалось отметить уход.\nПричина: {result_message}", parse_mode="HTML")
+        
+    await state.clear() 

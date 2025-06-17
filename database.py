@@ -62,9 +62,20 @@ class PostgresDatabase:
             # Add phone column if it doesn't exist (for existing databases)
             try:
                 await conn.execute('ALTER TABLE users ADD COLUMN phone TEXT')
-            except Exception:
+            except asyncpg.exceptions.DuplicateColumnError:
                 pass  # Column already exists
             
+            # Ensure work_sessions table has all necessary columns before creating it
+            try:
+                # This ensures the column exists for older databases before the table is potentially created
+                await conn.execute('ALTER TABLE work_sessions ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            except asyncpg.exceptions.UndefinedTableError:
+                # The table doesn't exist yet, it will be created with the column below.
+                pass
+            except asyncpg.exceptions.DuplicateColumnError:
+                # The column already exists, which is fine.
+                pass
+
             # Work sessions table
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS work_sessions (
@@ -209,7 +220,7 @@ class PostgresDatabase:
         """Get users waiting for approval"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch('''
-                SELECT user_id, username, full_name, display_name, first_seen
+                SELECT user_id, username, full_name, display_name, phone, category, first_seen
                 FROM users 
                 WHERE status = 'pending'
                 ORDER BY first_seen DESC
@@ -223,7 +234,7 @@ class PostgresDatabase:
             row = await conn.fetchrow('''
                 SELECT user_id, username, full_name, display_name, status, category, 
                        is_archived, archived_at, approved_by, approved_at, 
-                       first_seen, last_active, created_at
+                       first_seen, last_active
                 FROM users 
                 WHERE user_id = $1
             ''', user_id)
@@ -265,8 +276,7 @@ class PostgresDatabase:
             
             return True
     
-    async def check_in_with_time(self, user_id: int, username: str, full_name: str,
-                                checkin_datetime: datetime, latitude: float, longitude: float) -> bool:
+    async def check_in_with_time(self, user_id: int, checkin_datetime: datetime) -> (bool, str):
         """Check in user for work with custom time"""
         today = checkin_datetime.date()
         
@@ -278,16 +288,20 @@ class PostgresDatabase:
             ''', user_id, today)
             
             if existing:
-                return False  # Already checked in
+                return False, "Сотрудник уже отметил приход сегодня."
+
+            user_info = await self.get_user_info(user_id)
+            if not user_info:
+                return False, "Пользователь не найден."
             
             # Create new work session with custom time
             await conn.execute('''
                 INSERT INTO work_sessions 
                 (user_id, username, full_name, date, check_in_time, location_checkin_lat, location_checkin_lon)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ''', user_id, username, full_name, today, checkin_datetime, latitude, longitude)
+                VALUES ($1, $2, $3, $4, $5, NULL, NULL)
+            ''', user_id, user_info.get('username'), user_info.get('full_name'), today, checkin_datetime)
             
-            return True
+            return True, "Приход успешно зарегистрирован."
     
     async def check_out(self, user_id: int, latitude: float = None, longitude: float = None) -> Optional[int]:
         """Check out user from work, returns total minutes worked"""
@@ -318,8 +332,7 @@ class PostgresDatabase:
             
             return duration
     
-    async def check_out_with_time(self, user_id: int, checkout_datetime: datetime, 
-                                 latitude: float = None, longitude: float = None) -> Optional[int]:
+    async def check_out_with_time(self, user_id: int, checkout_datetime: datetime) -> (Optional[int], str):
         """Check out user from work with custom time, returns total minutes worked"""
         today = checkout_datetime.date()
         
@@ -331,10 +344,13 @@ class PostgresDatabase:
             ''', user_id, today)
             
             if not session:
-                return None  # No active session
+                return None, "У сотрудника нет активной смены для завершения."
             
             session_id, check_in_time = session['id'], session['check_in_time']
             
+            if checkout_datetime < check_in_time:
+                return None, "Время ухода не может быть раньше времени прихода."
+
             # Calculate duration in minutes
             duration = int((checkout_datetime - check_in_time).total_seconds() / 60)
             
@@ -343,9 +359,9 @@ class PostgresDatabase:
                 UPDATE work_sessions 
                 SET check_out_time = $1, total_duration = $2, location_checkout_lat = $3, location_checkout_lon = $4
                 WHERE id = $5
-            ''', checkout_datetime, duration, latitude, longitude, session_id)
+            ''', checkout_datetime, duration, None, None, session_id)
             
-            return duration
+            return duration, f"Уход успешно зарегистрирован. Отработано: {duration} минут."
     
     async def get_user_stats(self, user_id: int, days: int = 30) -> List[Dict[str, Any]]:
         """Get user statistics for specified number of days"""
@@ -430,6 +446,17 @@ class PostgresDatabase:
                 })
             
             return result
+    
+    async def get_users_by_status(self, status: str) -> List[Dict[str, Any]]:
+        """Get users filtered by status (e.g., 'approved', 'pending')."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT user_id, username, full_name, display_name, status, category, is_archived, last_active
+                FROM users 
+                WHERE status = $1 AND is_archived = FALSE
+                ORDER BY display_name, full_name
+            ''', status)
+            return [dict(row) for row in rows]
 
 # Create database instance
 db = PostgresDatabase() 

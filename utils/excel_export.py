@@ -5,13 +5,12 @@ import tempfile
 import os
 
 def format_duration(minutes: int) -> str:
-    """Format duration from minutes to hours and minutes"""
+    """Format duration from minutes to hours with decimal"""
     if minutes <= 0:
-        return "0 ч 0 мин"
+        return "0.0 ч"
     
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours} ч {mins} мин"
+    hours = minutes / 60
+    return f"{hours:.1f} ч"
 
 def format_datetime(dt_str: str) -> str:
     """Format datetime string for display"""
