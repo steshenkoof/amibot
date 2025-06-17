@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: timetracker-bot
+    env: docker
+    repo: https://github.com/steshenkoof/amibot.git
+    branch: master
+    buildCommand: docker build -t timetracker-bot .
+    startCommand: python run_bot.py
+    envVars:
+      - key: POSTGRES_HOST
+        sync: false
+      - key: POSTGRES_PORT
+        value: 5432
+      - key: POSTGRES_USER
+        sync: false
+      - key: POSTGRES_PASSWORD
+        sync: false
+      - key: POSTGRES_DATABASE
+        sync: false
+    autoDeploy: true
