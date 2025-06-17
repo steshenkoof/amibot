@@ -19,6 +19,10 @@ def get_main_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
         [
             KeyboardButton(text="📊 Моя статистика"),
             KeyboardButton(text="📥 Скачать отчёт")
+        ],
+        [
+            KeyboardButton(text="📅 График смен"),
+            KeyboardButton(text="🏢 Рабочее меню")
         ]
     ]
     

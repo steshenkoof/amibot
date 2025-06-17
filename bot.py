@@ -9,6 +9,7 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN
 from database import db
 from handlers import start, work, reports, admin, registration
+from utils.schedule import schedule_manager
 
 # Global bot instance for handlers
 bot = None
@@ -62,6 +63,15 @@ async def main():
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         return
+        
+    # Initialize schedule manager
+    logger.info("Initializing schedule manager...")
+    try:
+        await schedule_manager.setup()
+        logger.info("Schedule manager initialized successfully!")
+    except Exception as e:
+        logger.error(f"Schedule manager initialization failed: {e}")
+        # Continue anyway, as this is not critical
     
     # Create bot and dispatcher
     global bot

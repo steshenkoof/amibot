@@ -36,3 +36,6 @@ OFFICE_RADIUS = int(os.getenv('OFFICE_RADIUS', '100'))  # meters
 
 # Timezone
 TIMEZONE = os.getenv('TIMEZONE', 'Europe/Moscow') 
+
+# Schedule URL
+SCHEDULE_URL = os.getenv('SCHEDULE_URL', 'https://docs.google.com/spreadsheets/d/1Q2VS93-SsCwPCstV7cd3aVTZnf1gjJMB/edit?rtpof=true&sd=true&gid=1382745480#gid=1382745480')

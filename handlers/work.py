@@ -7,6 +7,7 @@ from datetime import datetime
 from database import db
 from utils.geolocation import is_within_office_radius, get_distance_to_office
 from utils.excel_export import format_duration
+from config import SCHEDULE_URL
 
 router = Router()
 
@@ -317,5 +318,147 @@ async def work_command(message: types.Message):
     """Handle /work command - same as work menu button"""
     # Reuse the work menu function
     await work_menu(message)
+
+@router.message(F.text == "📅 График смен")
+async def show_schedule(message: types.Message):
+    """Show schedule of shifts directly in Telegram"""
+    # Check if user is approved
+    status = await db.get_user_status(message.from_user.id)
+    if status != 'approved':
+        await message.answer(
+            "❌ **Доступ ограничен**\n\n"
+            "Ваш аккаунт не одобрен администратором.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    user_info = await db.get_user_info(message.from_user.id)
+    full_name = user_info.get('full_name') or message.from_user.full_name
+    
+    # Get employee schedule from utils.schedule module
+    try:
+        from utils.schedule import schedule_manager
+        
+        # Create keyboard for department selection
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="👨‍🍳 Кухня", callback_data="schedule_dept_kitchen")
+        keyboard.button(text="🍽️ Зал", callback_data="schedule_dept_hall")
+        keyboard.button(text="🍸 Бар", callback_data="schedule_dept_bar")
+        keyboard.button(text="🧹 Мойка", callback_data="schedule_dept_washing")
+        keyboard.button(text="📊 Мой график", callback_data=f"schedule_my_{message.from_user.id}")
+        keyboard.button(text="📊 Открыть полный график", url=schedule_manager.get_schedule_url())
+        keyboard.adjust(2, 2, 2)
+        
+        await message.answer(
+            "📅 **График смен**\n\n"
+            f"Здравствуйте, {full_name}!\n\n"
+            "Выберите отдел для просмотра графика смен или нажмите 'Мой график' для просмотра вашего личного расписания:",
+            reply_markup=keyboard.as_markup(),
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error showing schedule: {e}")
+        # Fallback to direct link if there's an error
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="📊 Открыть график смен", url=SCHEDULE_URL)]
+        ])
+        
+        await message.answer(
+            "📅 **График смен**\n\n"
+            "К сожалению, не удалось загрузить график смен напрямую.\n"
+            "Нажмите на кнопку ниже, чтобы открыть график смен в браузере:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+@router.callback_query(F.data.startswith("schedule_dept_"))
+async def show_department_schedule(callback: types.CallbackQuery):
+    """Show schedule for a specific department"""
+    department = callback.data.split("_")[2]
+    
+    try:
+        from utils.schedule import schedule_manager
+        schedule_text = await schedule_manager.format_department_schedule(department)
+        
+        # Add back button
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔙 Назад к выбору отдела", callback_data="schedule_back")
+        keyboard.button(text="📊 Открыть полный график", url=schedule_manager.get_schedule_url())
+        
+        await callback.message.edit_text(
+            schedule_text,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error showing department schedule: {e}")
+        await callback.message.edit_text(
+            "❌ Произошла ошибка при загрузке графика смен для отдела.\n"
+            "Пожалуйста, попробуйте позже или обратитесь к администратору.",
+            parse_mode="Markdown"
+        )
+    
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("schedule_my_"))
+async def show_my_schedule(callback: types.CallbackQuery):
+    """Show schedule for the current user"""
+    user_id = callback.data.split("_")[2]
+    
+    try:
+        # Get user info
+        user_info = await db.get_user_info(int(user_id))
+        full_name = user_info.get('full_name') or callback.from_user.full_name
+        
+        # Get schedule
+        from utils.schedule import schedule_manager
+        schedule_text = await schedule_manager.format_employee_schedule(full_name)
+        
+        # Add back button
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔙 Назад к выбору отдела", callback_data="schedule_back")
+        
+        await callback.message.edit_text(
+            schedule_text,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error showing user schedule: {e}")
+        await callback.message.edit_text(
+            "❌ Произошла ошибка при загрузке вашего графика смен.\n"
+            "Пожалуйста, попробуйте позже или обратитесь к администратору.",
+            parse_mode="Markdown"
+        )
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "schedule_back")
+async def schedule_back(callback: types.CallbackQuery):
+    """Return to schedule department selection"""
+    try:
+        from utils.schedule import schedule_manager
+        
+        # Create keyboard for department selection
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="👨‍🍳 Кухня", callback_data="schedule_dept_kitchen")
+        keyboard.button(text="🍽️ Зал", callback_data="schedule_dept_hall")
+        keyboard.button(text="🍸 Бар", callback_data="schedule_dept_bar")
+        keyboard.button(text="🧹 Мойка", callback_data="schedule_dept_washing")
+        keyboard.button(text="📊 Мой график", callback_data=f"schedule_my_{callback.from_user.id}")
+        keyboard.button(text="📊 Открыть полный график", url=schedule_manager.get_schedule_url())
+        keyboard.adjust(2, 2, 2)
+        
+        await callback.message.edit_text(
+            "📅 **График смен**\n\n"
+            "Выберите отдел для просмотра графика смен или нажмите 'Мой график' для просмотра вашего личного расписания:",
+            reply_markup=keyboard.as_markup(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error returning to schedule selection: {e}")
+    
+    await callback.answer()
 
 # Удален автоматический обработчик регистрации - теперь используется полная 4-шаговая регистрация 
